@@ -4,6 +4,8 @@ An end-to-end data pipeline that predicts cash-flow trouble and flags
 suspicious transactions before they become a crisis, for individuals and
 small businesses managing multiple accounts.
 
+**[Live demo →](#)** *(deploying now — link goes here once it's up)*
+
 ## Why this project
 
 Cash flow problems are the single most commonly cited reason small
@@ -17,34 +19,86 @@ withdrawal) that erode a cash position over time. CashPulse simulates
 that early-warning system: it ingests transactions into a proper
 relational database, forecasts 30 days of cash flow with a machine
 learning model (beating a naive baseline), flags anomalous transactions
-with an unsupervised model, and surfaces all of it in a BI-style
-dashboard.
+with an unsupervised model, tracks budget vs. actual spend and recurring
+subscriptions, and surfaces all of it in a BI-style dashboard.
 
 **This project intentionally exercises the whole pipeline a data role
-actually touches**: schema design (DBMS), ingestion/validation (ETL),
-predictive + unsupervised modeling (ML), and stakeholder-facing reporting
-(BI) — rather than stopping at a Jupyter notebook.
+actually touches**: schema design (DBMS), ingestion/validation (ETL vs.
+ELT), predictive + unsupervised modeling (ML), orchestration and infra
+(Airflow, Terraform), and stakeholder-facing reporting (BI) — rather than
+stopping at a Jupyter notebook.
 
-## Two tiers — start here, then go to `cloud/`
+## Two tiers, built in order
 
-This repo has two versions of the same idea, meant to be built in order:
+This repo has two versions of the same idea:
 
-1. **Local quickstart (this file, repo root)** — SQLite, no signups, no
+1. **Local quickstart** (what you're reading) — SQLite, no signups, no
    cost, nothing to tear down. Proves the pipeline logic works and is the
    right place to learn SQL and the ML models without cloud complexity
-   getting in the way.
-2. **[Cloud edition](cloud/README.md)** — the same pipeline rebuilt on AWS
-   RDS Postgres, dbt (ELT transformation), Apache Airflow (orchestration),
-   Terraform (infrastructure as code), and GitHub Actions (CI). This is
-   the tier that answers "have you used the tools real companies use" —
-   go there once the local tier makes sense to you. It includes an
-   explicit cost-safety checklist since real cloud accounts are involved.
+   getting in the way. This is what's deployed at the live demo link above.
+2. **Cloud edition** (`cloud/`) — the same pipeline rebuilt on Postgres
+   (standing in for AWS RDS), **dbt** for ELT transformation, **Apache
+   Airflow** for orchestration, **Terraform** for infrastructure as code,
+   and **GitHub Actions** for CI. This is the tier that answers "have you
+   used the tools real companies use."
 
 "I built it local-first to prove the logic, then migrated it to a
 cloud-native stack" is a genuinely strong thing to say in an interview —
 better than either tier alone.
 
-## Architecture (local quickstart)
+## Key design decisions
+
+The reasoning behind a few choices here is worth more than the code
+itself in an interview — pulled up front rather than left buried in
+inline comments:
+
+- **ETL locally, ELT in the cloud, on purpose.** The local tier validates
+  and transforms data *before* loading it (`etl/load_to_db.py` rejects bad
+  rows up front). The cloud tier flips this: `cloud/pipeline/load_raw.py`
+  lands raw, unvalidated CSVs straight into a `raw` schema, and dbt does
+  all validation and transformation downstream (`staging` → `analytics`).
+  That's not an inconsistency — it's the two dominant real-world patterns,
+  built once each, so both can be spoken to directly instead of one being
+  a guess.
+- **Postgres instead of a dedicated warehouse (Redshift/Snowflake/BigQuery).**
+  This project committed to strictly free-tier-safe AWS services.
+  Redshift Serverless's "free" tier is a time-boxed trial, not a real free
+  tier, so it was excluded to avoid billing risk. Running dbt directly
+  against Postgres — as both the operational and analytical store — is a
+  completely normal pattern at this data scale, and plenty of real
+  companies do exactly this instead of paying for a warehouse they don't
+  need yet.
+- **One-way data flow, both tiers.** Raw → validated → modeled →
+  BI-ready, always in that order — the BI layer never touches a raw table
+  directly in either tier.
+- **dbt tests gate the pipeline, not just document it.** 18 dbt tests
+  (uniqueness, not-null, referential integrity) run as part of `dbt test`,
+  and CI fails the build if any of them fail — the same gate a real data
+  team would put in front of anything downstream trusting this data.
+- **ML is backtested against a naive baseline, not just fit and shipped.**
+  The cash-flow forecaster's MAE is compared against a naive seasonal
+  baseline every run (`cloud/pipeline/ml_forecast.py` /
+  `ml/forecast_cashflow.py`) — "the model beats a naive guess" is a
+  claim this project can actually back up with a number, not an assumption.
+- **Honest about what was verified vs. what needs a human.** The cloud
+  tier's dbt project, ML pipeline, and Airflow DAG were all run and
+  verified end to end against a real local Postgres instance. Terraform
+  against real AWS and the Airflow Docker stack need a human's own AWS
+  account and Docker daemon to actually execute — flagged as such rather
+  than claimed. The same honesty carries into the dashboard itself: its
+  "Integrations" panel reads the real environment live and only ever
+  shows a connection that's actually there.
+- **A LocalStack path exists for the AWS-without-a-credit-card case.**
+  AWS requires a card on file to create any account, even a free-tier-only
+  one. `cloud/terraform-localstack/` provisions a genuinely real S3
+  bucket against LocalStack (a local AWS API simulator) with zero AWS
+  account needed — paired with a real Postgres run locally, since
+  LocalStack's free tier mocks RDS's API but doesn't run a database behind
+  it. That limitation is stated directly rather than glossed over.
+
+## Architecture
+
+**Local quickstart:**
 
 ```
 generate_data.py          load_to_db.py            detect_anomalies.py
@@ -57,13 +111,41 @@ generate_data.py          load_to_db.py            detect_anomalies.py
                     -------------------------------
                     |                              |
               dashboard/app.py              Power BI / Tableau
-              (Streamlit)                   (see dashboard/POWER_BI_TABLEAU_GUIDE.md)
+              (Streamlit)                   (native ODBC/Postgres connector)
 ```
 
-Data flows one direction: raw CSVs → validated relational tables → model
-outputs written back into their own tables → BI layer queries clean views,
-never raw tables. That separation (dumb storage, smart pipeline, thin BI
-layer) is deliberate and worth explaining in an interview.
+**Cloud edition:**
+
+```
+data/generate_data.py  (simulated source system)
+        |
+        v
+cloud/pipeline/load_raw.py  ---------->  Postgres: raw.*  (unvalidated landing tables)
+                                                |
+                                                v
+                                    dbt: staging.stg_*  (typed, cleaned views)
+                                                |
+                                                v
+                                    dbt: analytics.*  (fact/dim tables + marts, tested)
+                                          |                    |
+                                          v                    v
+                          cloud/pipeline/ml_anomaly.py   ml_forecast.py
+                                          |                    |
+                                          v                    v
+                                    Postgres: ml.anomaly_flags / ml.cashflow_forecast
+                                                |
+                                    ------------+------------
+                                    |                        |
+                              dashboard/app.py        Power BI / Tableau
+                              (DATABASE_URL set)      (native Postgres connector)
+```
+
+Orchestrated end-to-end by the Airflow DAG in `cloud/airflow/`.
+Infrastructure (a Postgres instance + an S3 landing bucket) is provisioned
+by `cloud/terraform/` (real AWS) or `cloud/terraform-localstack/` (free,
+no-account alternative). Both tiers keep the same separation — dumb
+storage, smart pipeline, thin BI layer — so the BI layer only ever reads
+clean, tested views, never raw tables.
 
 ## Folder structure
 
@@ -81,13 +163,21 @@ finance-health-monitor/
 │   ├── detect_anomalies.py      # Isolation Forest -> ml_anomaly_flags
 │   └── forecast_cashflow.py     # Gradient boosted regressor -> ml_cashflow_forecast
 ├── dashboard/
-│   ├── app.py                   # Streamlit BI-style dashboard
-│   └── POWER_BI_TABLEAU_GUIDE.md
+│   └── app.py                   # Streamlit BI-style dashboard (both tiers)
+├── cloud/                       # Postgres + dbt + Airflow + Terraform edition
+│   ├── pipeline/                # load_raw, ML jobs, orchestration tasks
+│   ├── dbt/cashpulse_dbt/       # staging -> marts, 18 dbt tests
+│   ├── airflow/                 # DAG + docker-compose
+│   ├── terraform/               # real AWS: RDS + S3
+│   └── terraform-localstack/    # free, no-account alternative: S3 only
+├── .github/workflows/ci.yml     # lint + dbt test + pytest on every push
 ├── requirements.txt
 └── README.md
 ```
 
 ## Setup & run order
+
+**Local quickstart:**
 
 ```bash
 python -m venv venv
@@ -101,8 +191,25 @@ python ml/forecast_cashflow.py    # 4. forecast next 30 days of cash flow
 streamlit run dashboard/app.py    # 5. view the dashboard at localhost:8501
 ```
 
-Then follow `dashboard/POWER_BI_TABLEAU_GUIDE.md` to connect the same
-database to Power BI or Tableau for real BI-tool practice.
+(The dashboard also generates this data automatically on first run if it's
+missing — e.g. right after cloning — so steps 1-4 are optional convenience,
+not a hard requirement.)
+
+**Cloud edition**, once you have a Postgres instance reachable (real RDS
+via `cloud/terraform/`, or local/Docker Postgres paired with the free
+LocalStack S3 path in `cloud/terraform-localstack/`):
+
+```bash
+pip install -r cloud/requirements.txt
+export DATABASE_URL=postgresql://user:pass@host:5432/cashpulse
+python cloud/pipeline/run_pipeline.py     # generate -> load raw -> dbt run/test -> ML
+streamlit run dashboard/app.py            # same dashboard, same DATABASE_URL
+```
+
+`cloud/pipeline/run_pipeline.py` runs the whole chain in one shot; see the
+files under `cloud/` for how each stage works individually, and
+`cloud/airflow/` to run the same chain as an orchestrated DAG instead of a
+script.
 
 ## About the data
 
@@ -110,82 +217,63 @@ All data is synthetically generated (`data/generate_data.py`, seeded for
 reproducibility) — it is not real financial data. This is a standard,
 legitimate approach for a portfolio project since real bank data isn't
 something you can legally source or share. The generator injects realistic
-patterns on purpose: recurring bills, payroll cycles, seasonal retail
-bumps, and six intentional anomalies (large withdrawals, duplicate
-charges, card-testing-style rapid small charges) so the ML step has real
-signal to find — and so you can verify its output against ground truth
-you control.
+patterns on purpose: recurring bills with stable per-merchant pricing,
+payroll cycles, seasonal retail bumps, budgets sized off each account's
+own real spending (not arbitrary numbers), and six intentional anomalies
+(large withdrawals, duplicate charges, card-testing-style rapid small
+charges) so the ML step has real signal to find — and so you can verify
+its output against ground truth you control.
 
 ## What each layer demonstrates
 
 - **DBMS**: a normalized schema (accounts, categories, merchants,
-  transactions, budgets) plus purpose-built views that pre-aggregate for
-  reporting — the schema doc in `sql/schema.sql` explains the design
-  choices inline.
-- **ETL**: `etl/load_to_db.py` resolves foreign keys, rejects invalid rows
-  (bad amounts, bad types, missing dates) instead of silently loading
-  garbage, and logs what it rejected.
+  transactions, budgets) plus purpose-built views/marts that pre-aggregate
+  for reporting — `sql/schema.sql` and the dbt models under `cloud/dbt/`
+  explain the design choices inline.
+- **ETL / ELT**: `etl/load_to_db.py` resolves foreign keys and rejects
+  invalid rows before loading (ETL); `cloud/pipeline/load_raw.py` +
+  dbt validate and transform after loading (ELT) — both built, not just
+  one assumed.
 - **ML**: an Isolation Forest for unsupervised anomaly detection (no
   labels needed — appropriate since nobody has labeled fraud data for
   their own transactions) and a gradient-boosted regressor for cash-flow
   forecasting, backtested against a naive seasonal baseline so the model's
   value is quantified rather than assumed.
-- **BI**: a working Streamlit dashboard plus a guided path to build the
-  same reporting in Power BI or Tableau against the same database.
-
-## Extending it further
-
-The obvious next steps here — Postgres instead of SQLite, Airflow instead
-of running scripts by hand, Terraform-provisioned cloud infrastructure, a
-dbt transformation layer, CI — aren't just ideas to mention in an
-interview anymore. They're built and verified in **[`cloud/`](cloud/README.md)**.
-Go there next.
-
-If you want ideas beyond even that: swap the generator for a real
-(permissioned) data source like the Plaid sandbox API, add a Slack/email
-alert when a dbt test fails, or add a second BI tool (Looker Studio is
-free and pairs well with a cloud SQL database) to compare against Power
-BI/Tableau.
-
-## Integrations & Proof
-
-AWS and Power BI/Tableau are the two pieces of this project that need
-your own account/install to actually complete — no one can click
-"Publish" for you. **[`INTEGRATION_PROOF_GUIDE.md`](INTEGRATION_PROOF_GUIDE.md)**
-is the short, specific path to doing both and capturing real proof
-(a Terraform output, an AWS Console screenshot, a published Power BI
-link) that shows up automatically in the dashboard's **Integrations**
-section and slots straight into this README. Once you've done it, add a
-section here following that guide's template.
+- **Orchestration & IaC**: an Airflow DAG that gates ML tasks behind a dbt
+  test pass, and Terraform-provisioned infrastructure (real AWS, or a
+  free LocalStack alternative).
+- **CI**: GitHub Actions runs lint, the full dbt build/test cycle against
+  an ephemeral Postgres container, and the pytest suite on every push.
+- **BI**: a working Streamlit dashboard (budget vs. actual, recurring
+  subscriptions, anomaly flags, cash-flow forecast) that reads either
+  backend through the same code, plus a native path to point Power BI or
+  Tableau at the same database.
 
 ## Resume / interview bullet points
-
-Use whichever best fits the role you're applying for — these are written
-to be true to what this project actually does, so adapt the numbers if
-you change the data scale. **If you've also built the [cloud edition](cloud/README.md),
-use its resume bullets instead/in addition — they cover Terraform, dbt,
-Airflow, and CI, which is a stronger signal for most data engineering and
-analytics roles than the local tier alone.**
 
 - "Built an end-to-end personal/SME finance analytics pipeline (Python,
   SQL, scikit-learn, Streamlit) that ingests transaction data into a
   normalized relational database, forecasts 30-day cash flow with a
   gradient-boosted model that outperforms a naive baseline, and flags
   anomalous transactions via unsupervised learning."
-- "Designed a normalized database schema and BI-ready SQL views to
+- "Provisioned cloud infrastructure (Postgres, S3) with Terraform, and
+  built an ELT pipeline (Python extract/load, dbt for transformation)
+  with 18 automated data-quality tests gating a downstream ML layer."
+- "Orchestrated a multi-stage pipeline (data load, dbt transform/test, ML
+  forecasting and anomaly detection) with Apache Airflow, including a
+  quality gate that halts the DAG before bad data reaches ML or BI."
+- "Set up CI (GitHub Actions) that runs the full ELT pipeline and test
+  suite against an ephemeral database on every push, catching pipeline
+  regressions before merge."
+- "Designed a normalized database schema and BI-ready SQL views/marts to
   decouple data storage from reporting, enabling both a custom dashboard
   and Power BI/Tableau to consume the same clean data layer."
-- "Implemented an ETL process with data validation and referential
-  integrity checks, rejecting and logging malformed records rather than
-  silently loading bad data."
-- "Applied Isolation Forest for unsupervised fraud/anomaly detection on
-  transaction data with no labeled ground truth, and validated model
-  quality with engineered features like category-relative z-scores."
 
 ## A note on honesty
 
-If you present this project (resume, interview, GitHub), be upfront that
-the data is synthetic/simulated — that's completely normal for a learning
-project and nobody will hold it against you. What matters is that the
-pipeline, schema design, modeling choices, and evaluation methodology are
-real and defensible, and they are.
+The data is synthetic/simulated — that's completely normal for a learning
+project and nobody will hold it against you, as long as you say so
+upfront. What matters is that the pipeline, schema design, modeling
+choices, and evaluation methodology are real and defensible, and they are:
+every piece described above was actually run and verified, not just
+written and assumed to work.
