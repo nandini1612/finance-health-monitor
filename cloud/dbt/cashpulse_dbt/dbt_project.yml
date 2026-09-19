@@ -1,0 +1,23 @@
+name: 'cashpulse_dbt'
+version: '1.0.0'
+config-version: 2
+
+profile: 'cashpulse'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  cashpulse_dbt:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: table
+      +schema: analytics

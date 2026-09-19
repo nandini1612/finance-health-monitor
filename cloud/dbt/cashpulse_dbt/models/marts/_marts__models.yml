@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: dim_accounts
+    description: One row per account.
+    columns:
+      - name: account_id
+        tests: [unique, not_null]
+
+  - name: dim_categories
+    description: One row per spending category.
+
+  - name: fct_transactions
+    description: The core fact table -- every transaction, categorized.
+    columns:
+      - name: transaction_id
+        tests: [unique, not_null]
+      - name: account_id
+        tests:
+          - relationships:
+              arguments:
+                to: ref('dim_accounts')
+                field: account_id
+
+  - name: monthly_cashflow
+    description: Income, expense and net flow rolled up by account and month.
+
+  - name: category_spend_monthly
+    description: Debit spend by category, per account per month.
+
+  - name: account_health
+    description: Current balance and 30-day average burn rate per account.
+    columns:
+      - name: account_id
+        tests: [unique, not_null]
+
+  - name: budget_vs_actual
+    description: >
+      Budgeted vs. actual debit spend per account/category/month. Spine is
+      the budgets table, so only categories with a budget set appear.
+
+  - name: recurring_transactions
+    description: >
+      One row per (account, merchant) with at least one is_recurring
+      transaction -- typical amount, occurrence count, and the most recent
+      charge, for the Subscriptions panel.

@@ -1,0 +1,83 @@
+name: CashPulse CI
+
+# Runs entirely against an ephemeral Postgres service container -- no AWS
+# credentials, no RDS instance, no cost. This mirrors exactly what was
+# verified by hand while building this project: load_raw -> dbt run ->
+# dbt test -> pytest against pipeline/tasks.py. A red build here means
+# "don't trust this commit's data pipeline," the same way a red build
+# anywhere else means "don't trust this commit's code."
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cloud-pipeline:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: cashpulse
+          POSTGRES_PASSWORD: cashpulse_ci
+          POSTGRES_DB: cashpulse
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://cashpulse:cashpulse_ci@localhost:5432/cashpulse
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: cashpulse
+      DB_PASSWORD: cashpulse_ci
+      DB_NAME: cashpulse
+      DBT_PROFILES_DIR: ${{ github.workspace }}/cloud/dbt/cashpulse_dbt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r cloud/requirements.txt
+          pip install pytest flake8
+
+      - name: Lint
+        run: flake8 cloud/pipeline data/generate_data.py
+
+      - name: Generate synthetic data
+        run: python data/generate_data.py
+
+      - name: Load raw zone
+        working-directory: cloud/pipeline
+        run: python load_raw.py
+
+      - name: dbt run
+        working-directory: cloud/dbt/cashpulse_dbt
+        run: dbt run
+
+      - name: dbt test (data quality gate)
+        working-directory: cloud/dbt/cashpulse_dbt
+        run: dbt test
+
+      - name: Unit test pipeline task functions
+        working-directory: cloud/pipeline
+        run: pytest -v
+
+      - name: ML smoke test (anomaly detection + forecast actually run)
+        working-directory: cloud/pipeline
+        run: |
+          python ml_anomaly.py
+          python ml_forecast.py

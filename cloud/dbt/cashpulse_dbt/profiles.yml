@@ -1,0 +1,21 @@
+# dbt connection profile -- no secrets live in this file, only env_var()
+# references, so it's safe to commit. Point DBT_PROFILES_DIR at this
+# directory (or copy it to ~/.dbt/profiles.yml) and set the env vars below
+# (see cloud/.env.example) before running dbt.
+#
+# The same profile works whether DB_HOST points at localhost (local test
+# Postgres) or an RDS endpoint -- nothing about the dbt project changes
+# between "development" and "cloud".
+
+cashpulse:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DB_HOST', 'localhost') }}"
+      port: "{{ env_var('DB_PORT', '5432') | as_number }}"
+      user: "{{ env_var('DB_USER', 'cashpulse') }}"
+      password: "{{ env_var('DB_PASSWORD') }}"
+      dbname: "{{ env_var('DB_NAME', 'cashpulse') }}"
+      schema: public
+      threads: 4

@@ -1,0 +1,35 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/*.csv
+data/finance.db
+.DS_Store
+
+# cloud tier -- secrets and generated/state files, never commit these
+cloud/.env
+cloud/terraform/.terraform/
+cloud/terraform/.terraform.lock.hcl
+cloud/terraform/terraform.tfstate
+cloud/terraform/terraform.tfstate.backup
+cloud/terraform/terraform.tfvars
+cloud/terraform-localstack/.terraform/
+cloud/terraform-localstack/.terraform.lock.hcl
+cloud/terraform-localstack/terraform.tfstate
+cloud/terraform-localstack/terraform.tfstate.backup
+cloud/terraform-localstack/terraform.tfvars
+cloud/dbt/cashpulse_dbt/target/
+cloud/dbt/cashpulse_dbt/logs/
+cloud/dbt/cashpulse_dbt/dbt_packages/
+cloud/airflow/logs/
+cloud/airflow/.env
+cloud/dbt/cashpulse_dbt/.user.yml
+
+# internal/working docs -- kept local, not published to GitHub.
+# README.md is the only doc meant to be public; everything else here is
+# working notes for you, not the repo's public face.
+ROADMAP.md
+INTEGRATION_PROOF_GUIDE.md
+cloud/README.md
+cloud/terraform-localstack/README.md
+dashboard/POWER_BI_TABLEAU_GUIDE.md

@@ -1,0 +1,14 @@
+# Pin dbt-postgres only (not dbt-core separately) -- pip resolves the
+# matching dbt-core version automatically. Pinning dbt-core yourself risks
+# a protobuf dependency conflict with dbt-adapters (hit and fixed while
+# building this project); letting dbt-postgres drive the resolution avoids it.
+# Also note: as of late 2025/2026, `pip install dbt-core` alone can pull in
+# dbt Labs' newer Rust-based "Fusion" engine, which does not yet support
+# Postgres -- installing dbt-postgres explicitly (as below) avoids that trap.
+dbt-postgres==1.11.0
+
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2

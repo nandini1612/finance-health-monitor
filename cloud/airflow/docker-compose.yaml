@@ -1,0 +1,105 @@
+# CashPulse Cloud Edition - local Airflow (LocalExecutor).
+#
+# This runs Airflow itself on your machine via Docker -- it does NOT touch
+# AWS. The DAG it schedules connects OUT to your RDS Postgres instance (or
+# a local Postgres for testing) via DATABASE_URL/DB_* env vars, exactly like
+# running cloud/pipeline/run_pipeline.py by hand. Running the orchestrator
+# locally and the database in the cloud is a completely normal, free way to
+# get real orchestration experience without paying for a hosted Airflow
+# service (AWS MWAA and Astronomer Cloud both charge per environment-hour
+# with no meaningful free tier).
+#
+# Trimmed from Apache Airflow's official docker-compose reference
+# (https://airflow.apache.org/docs/apache-airflow/stable/docker-compose.yaml)
+# down to what this single-DAG project needs: LocalExecutor + one Postgres
+# for Airflow's own metadata (separate from your RDS/analytics database),
+# webserver, and scheduler.
+#
+# Run:
+#   cd cloud/airflow
+#   cp ../.env.example .env        # fill in DATABASE_URL / DB_* for your RDS or local test db
+#   docker compose up airflow-init  # first time only: creates the admin user
+#   docker compose up
+#   open http://localhost:8080  (user: airflow / pass: airflow -- change this if you expose it beyond localhost)
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.3-python3.11
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-metadata-db/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    # Dev-only convenience: installs cloud/requirements.txt into the container
+    # at startup. For anything beyond local dev, bake a custom image instead
+    # (this re-installs on every container start, which is slow).
+    _PIP_ADDITIONAL_REQUIREMENTS: -r /opt/airflow/cashpulse-requirements.txt
+    # Passed through to the DAG's tasks.py / ml_*.py / load_raw.py -- point
+    # these at your RDS endpoint, or at the local test Postgres for a dry run.
+    DATABASE_URL: ${DATABASE_URL}
+    DB_HOST: ${DB_HOST}
+    DB_PORT: ${DB_PORT:-5432}
+    DB_USER: ${DB_USER}
+    DB_PASSWORD: ${DB_PASSWORD}
+    DB_NAME: ${DB_NAME}
+    DBT_PROFILES_DIR: /opt/airflow/dbt/cashpulse_dbt
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ../pipeline:/opt/airflow/pipeline
+    - ../dbt:/opt/airflow/dbt
+    - ../requirements.txt:/opt/airflow/cashpulse-requirements.txt
+    - ../../data:/opt/airflow/data
+    - airflow-logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-metadata-db:
+      condition: service_healthy
+
+services:
+  airflow-metadata-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-metadata-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username airflow --password airflow \
+          --firstname Cash --lastname Pulse \
+          --role Admin --email you@example.com || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  airflow-metadata-db-volume:
+  airflow-logs:

@@ -1,0 +1,6 @@
+[flake8]
+max-line-length = 120
+# E203/E127/E128: whitespace-before-punctuation and continuation-line-indent
+# rules that conflict with how this project hand-aligns wrapped arguments --
+# a common, deliberate ignore list (matches what Black-formatted projects use).
+extend-ignore = E203,E127,E128

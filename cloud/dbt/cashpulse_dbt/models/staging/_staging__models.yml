@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: stg_accounts
+    description: One row per account, typed and trimmed.
+    columns:
+      - name: account_id
+        tests: [unique, not_null]
+
+  - name: stg_categories
+    description: Category reference data, one row per category.
+    columns:
+      - name: category_id
+        tests: [unique, not_null]
+
+  - name: stg_merchants
+    description: Merchant directory with default category.
+    columns:
+      - name: merchant_id
+        tests: [unique, not_null]
+
+  - name: stg_transactions
+    description: Cleaned transaction feed. Rows with unparseable amounts or bad txn_type are dropped.
+    columns:
+      - name: transaction_id
+        tests: [unique, not_null]
+      - name: account_id
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_accounts')
+                field: account_id
+      - name: txn_type
+        tests:
+          - accepted_values:
+              values: ['credit', 'debit']
+
+  - name: stg_budgets
+    description: Monthly budgeted amount per account/category.
