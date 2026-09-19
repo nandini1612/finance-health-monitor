@@ -4,7 +4,7 @@ An end-to-end data pipeline that predicts cash-flow trouble and flags
 suspicious transactions before they become a crisis, for individuals and
 small businesses managing multiple accounts.
 
-**[Live demo →](#)** *(deploying now — link goes here once it's up)*
+**[Live demo →](https://finance-health-monitor.streamlit.app/)**
 
 ## Why this project
 
