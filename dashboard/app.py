@@ -32,7 +32,9 @@ Run:
 """
 
 import os
+import subprocess
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -44,6 +46,36 @@ import streamlit as st
 LOCAL_DB_PATH = Path(__file__).parent.parent / "data" / "finance.db"
 DATABASE_URL = os.environ.get("DATABASE_URL")
 BACKEND = "postgres" if DATABASE_URL else "sqlite"
+
+
+def _bootstrap_local_data():
+    """First-run setup for the local SQLite tier.
+
+    data/finance.db and the CSVs it's built from are gitignored on purpose
+    (they're generated artifacts, not source) -- which means a fresh clone,
+    or a fresh deploy on something like Streamlit Community Cloud, starts
+    with no database at all. Cloud deploy platforms only run
+    `streamlit run dashboard/app.py`; there's no hook to run a setup script
+    first. So: if the SQLite backend is selected and the database simply
+    isn't there yet, generate the synthetic dataset and load it once,
+    automatically, the same two steps the README asks you to run by hand
+    locally. This is what makes "clone and run" or "open the deployed link"
+    actually work with zero manual setup, instead of failing on a database
+    that was never allowed into git to begin with.
+    """
+    if LOCAL_DB_PATH.exists():
+        return
+    repo_root = Path(__file__).parent.parent
+    with st.spinner("First run: generating sample data..."):
+        subprocess.run(
+            [sys.executable, str(repo_root / "data" / "generate_data.py")],
+            check=True, cwd=repo_root,
+        )
+        subprocess.run(
+            [sys.executable, str(repo_root / "etl" / "load_to_db.py")],
+            check=True, cwd=repo_root,
+        )
+
 
 # Set AWS_INTEGRATION_MODE=localstack when DATABASE_URL points at a *real*
 # Postgres (Docker/local install) standing in for RDS, provisioned via
@@ -61,6 +93,9 @@ ASSETS_DIR = Path(__file__).parent / "assets" / "integration_proof"
 POWERBI_URL_FILE = Path(__file__).parent / "assets" / "powerbi_report_url.txt"
 
 st.set_page_config(page_title="CashPulse", page_icon="\U0001F4B0", layout="wide")
+
+if BACKEND == "sqlite":
+    _bootstrap_local_data()
 
 _engine = None
 if BACKEND == "postgres":
