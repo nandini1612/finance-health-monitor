@@ -32,6 +32,7 @@ Run:
 """
 
 import os
+import re
 import subprocess
 import sqlite3
 import sys
@@ -218,6 +219,17 @@ QUERIES = {
             GROUP BY t.merchant_id, m.merchant_name
             ORDER BY last_txn_date DESC
         """,
+        "category_transactions": """
+            SELECT t.txn_date, m.merchant_name, t.amount, t.is_recurring
+            FROM transactions t
+            JOIN categories c ON c.category_id = t.category_id
+            LEFT JOIN merchants m ON m.merchant_id = t.merchant_id
+            WHERE t.account_id = :account_id
+              AND c.category_name = :category_name
+              AND t.txn_type = 'debit'
+              AND strftime('%Y-%m', t.txn_date) BETWEEN :start_month AND :end_month
+            ORDER BY t.txn_date DESC
+        """,
     },
     "postgres": {
         "accounts": "SELECT account_id, account_name, account_type FROM analytics.dim_accounts",
@@ -244,6 +256,15 @@ QUERIES = {
             FROM analytics.recurring_transactions
             WHERE account_id = :account_id
             ORDER BY last_txn_date DESC
+        """,
+        "category_transactions": """
+            SELECT txn_date, merchant_name, amount, is_recurring
+            FROM analytics.fct_transactions
+            WHERE account_id = :account_id
+              AND category_name = :category_name
+              AND txn_type = 'debit'
+              AND to_char(txn_date, 'YYYY-MM') BETWEEN :start_month AND :end_month
+            ORDER BY txn_date DESC
         """,
     },
 }
@@ -306,6 +327,11 @@ def base_layout(fig, height=340):
                     zerolinecolor=COLOR["grid"], color=COLOR["muted"]),
     )
     return fig
+
+
+def _slug(text):
+    """Filesystem/URL-safe filename fragment, e.g. "Nina's Checking" -> "ninas_checking"."""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
 def _redact_db_host(url):
@@ -501,6 +527,43 @@ def main():
         else:
             st.info("No forecast data yet.")
 
+    # --- Date range filter ---------------------------------------------------
+    # Feeds the two sections below (Spend by Category, Budget vs. Actual),
+    # which used to be locked to whatever "latest month" happened to be in
+    # the data -- no way to look at a different month or a wider window.
+    # Defaults to the latest available month so the page looks the same as
+    # before until you touch it. The KPI row above (avg daily burn, runway)
+    # deliberately stays a fixed "as of today" snapshot rather than
+    # following this filter -- those are current-status numbers, not a
+    # report you'd browse historically.
+    if not monthly.empty:
+        min_month_date = datetime.strptime(monthly["month"].min(), "%Y-%m").date()
+        max_month_date = datetime.strptime(monthly["month"].max(), "%Y-%m").date()
+        date_range = st.date_input(
+            "Date range (filters Spend by Category and Budget vs. Actual below)",
+            value=(max_month_date, max_month_date),
+            min_value=min_month_date, max_value=max_month_date,
+        )
+        if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+            range_start, range_end = date_range
+        else:
+            single = date_range[0] if isinstance(date_range, (tuple, list)) else date_range
+            range_start = range_end = single
+        if range_start > range_end:
+            range_start, range_end = range_end, range_start
+        start_month = range_start.strftime("%Y-%m")
+        end_month = range_end.strftime("%Y-%m")
+    else:
+        start_month, end_month = "0000-00", "9999-99"
+    range_label = start_month if start_month == end_month else f"{start_month} → {end_month}"
+
+    category_spend_filtered = category_spend[
+        (category_spend["month"] >= start_month) & (category_spend["month"] <= end_month)
+    ]
+    budget_vs_actual_filtered = budget_vs_actual[
+        (budget_vs_actual["month"] >= start_month) & (budget_vs_actual["month"] <= end_month)
+    ]
+
     # --- Category breakdown ------------------------------------------------
     # A pie chart doesn't hold up once there are more than a handful of
     # categories (this data has up to ~14): slice angles get too thin to
@@ -508,11 +571,13 @@ def main():
     # slots. This is really a magnitude-comparison job ("which categories
     # cost the most"), so it becomes a single-hue horizontal bar ranked by
     # spend, with the $ amount labeled directly on each bar.
-    st.subheader("Spend by Category (latest month)")
+    st.subheader("Spend by Category")
     with st.container(border=True):
-        if not category_spend.empty:
-            latest_month = category_spend["month"].iloc[0]
-            latest = category_spend[category_spend["month"] == latest_month].copy()
+        st.caption(f"Showing: {range_label} · click a bar to see its transactions")
+        if not category_spend_filtered.empty:
+            latest = (
+                category_spend_filtered.groupby("category_name", as_index=False)["total_amount"].sum()
+            )
             latest = latest.sort_values("total_amount", ascending=True)
 
             n = len(latest)
@@ -542,9 +607,36 @@ def main():
             fig_cat.update_xaxes(showgrid=True, range=[0, max_spend * 1.22])
             base_layout(fig_cat, height=max(300, 34 * n))
             fig_cat.update_layout(margin=dict(l=10, r=30, t=10, b=10))
-            st.plotly_chart(fig_cat, use_container_width=True, config={"displayModeBar": False})
+            # on_select="rerun" turns a bar click into a normal Streamlit
+            # rerun with the clicked point available below -- no custom JS
+            # needed, just Streamlit's native chart-selection event (1.35+).
+            cat_event = st.plotly_chart(
+                fig_cat, use_container_width=True, config={"displayModeBar": False},
+                on_select="rerun", selection_mode="points", key="category_chart",
+            )
+
+            selected_category = None
+            if cat_event and cat_event["selection"]["points"]:
+                selected_category = cat_event["selection"]["points"][0].get("y")
+
+            if selected_category:
+                drill = load_table("category_transactions", {
+                    "account_id": account_id, "category_name": selected_category,
+                    "start_month": start_month, "end_month": end_month,
+                })
+                st.markdown(f"**{selected_category} transactions — {range_label}**")
+                if not drill.empty:
+                    st.dataframe(
+                        drill.rename(columns={
+                            "txn_date": "Date", "merchant_name": "Merchant",
+                            "amount": "Amount", "is_recurring": "Recurring",
+                        }).style.format({"Amount": "${:,.2f}"}),
+                        width="stretch",
+                    )
+                else:
+                    st.info("No transactions found for this category in the selected range.")
         else:
-            st.info("No category spend data yet.")
+            st.info("No category spend data for the selected date range.")
 
     # --- Budget vs. actual ---------------------------------------------------
     # Status (over/under budget) is what matters here, not raw category
@@ -552,11 +644,15 @@ def main():
     # critical) rather than one trace colored per-bar -- a single bar trace
     # can't carry two different legend colors cleanly, and color needs to
     # follow a fixed entity (the status), never vary within one legend swatch.
-    st.subheader("Budget vs. Actual (latest month)")
+    st.subheader("Budget vs. Actual")
     with st.container(border=True):
-        if not budget_vs_actual.empty:
-            bva_month = budget_vs_actual["month"].max()
-            bva = budget_vs_actual[budget_vs_actual["month"] == bva_month].copy()
+        st.caption(f"Showing: {range_label}")
+        if not budget_vs_actual_filtered.empty:
+            bva = (
+                budget_vs_actual_filtered
+                .groupby("category_name", as_index=False)[["budgeted_amount", "actual_amount"]]
+                .sum()
+            )
             bva = bva.sort_values("budgeted_amount", ascending=True)
             within = bva[bva["actual_amount"] <= bva["budgeted_amount"]]
             over = bva[bva["actual_amount"] > bva["budgeted_amount"]]
@@ -586,9 +682,9 @@ def main():
 
             if not over.empty:
                 names = ", ".join(over["category_name"])
-                st.warning(f"⚠️ Over budget in {bva_month}: {names}")
+                st.warning(f"⚠️ Over budget in {range_label}: {names}")
         else:
-            st.info("No budgets set for this account yet.")
+            st.info("No budgets set for the selected date range.")
 
     # --- Recurring & subscriptions --------------------------------------------
     st.subheader("\U0001F501 Recurring & Subscriptions")
@@ -625,6 +721,13 @@ def main():
         st.dataframe(
             anomalies.style.format({"amount": "${:,.2f}", "anomaly_score": "{:.2f}"}),
             width="stretch",
+        )
+        st.download_button(
+            "⬇ Download flagged transactions (CSV)",
+            data=anomalies.to_csv(index=False).encode("utf-8"),
+            file_name=f"cashpulse_flagged_transactions_{_slug(account_name)}.csv",
+            mime="text/csv",
+            key="download_anomalies",
         )
     else:
         st.info("No anomalies flagged yet.")
