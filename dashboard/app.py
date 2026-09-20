@@ -230,6 +230,20 @@ QUERIES = {
               AND strftime('%Y-%m', t.txn_date) BETWEEN :start_month AND :end_month
             ORDER BY t.txn_date DESC
         """,
+        # The next three back the "Manage Transactions" section, which only
+        # exists for this tier -- see _get_write_conn()'s docstring for why.
+        "categories": "SELECT category_id, category_name FROM categories ORDER BY category_name",
+        "merchants": "SELECT merchant_id, merchant_name, default_category_id FROM merchants ORDER BY merchant_name",
+        "all_transactions": """
+            SELECT t.transaction_id, t.txn_date, m.merchant_name, c.category_name,
+                   t.amount, t.txn_type, t.description, t.is_recurring
+            FROM transactions t
+            JOIN categories c ON c.category_id = t.category_id
+            LEFT JOIN merchants m ON m.merchant_id = t.merchant_id
+            WHERE t.account_id = :account_id
+            ORDER BY t.txn_date DESC, t.transaction_id DESC
+            LIMIT 300
+        """,
     },
     "postgres": {
         "accounts": "SELECT account_id, account_name, account_type FROM analytics.dim_accounts",
@@ -281,6 +295,59 @@ def load_table(query_key, params=None):
         return pd.read_sql_query(query, conn, params=params)
     finally:
         conn.close()
+
+
+def _get_write_conn():
+    """A separate, non-cached connection for the "Manage Transactions"
+    write path -- SQLite tier only.
+
+    `load_table` above is deliberately read-only and cached (`ttl=60`);
+    routing writes through here instead, then explicitly clearing that
+    cache and rerunning, keeps the read path simple while still making
+    edits show up immediately everywhere else on the page. This only
+    exists for SQLite: the cloud tier's dbt pipeline treats `raw.*` as
+    immutable and rebuilds `analytics.*` from it on every run, so a direct
+    write to Postgres here would just get silently overwritten on the next
+    `dbt run` -- manual entry stays local-tier-only until that's addressed
+    (see ROADMAP.md)."""
+    return sqlite3.connect(LOCAL_DB_PATH, timeout=10)
+
+
+def _get_or_create_merchant(conn, merchant_name, category_id):
+    """Look up a merchant by name, or create it with `category_id` as its
+    default -- this is the "inline learning" half of auto-categorization:
+    the first time a brand-new merchant is used, whatever category you
+    pick for it becomes its suggested category from then on."""
+    row = conn.execute(
+        "SELECT merchant_id FROM merchants WHERE merchant_name = ?", (merchant_name,)
+    ).fetchone()
+    if row:
+        return row[0]
+    cur = conn.execute(
+        "INSERT INTO merchants (merchant_name, default_category_id) VALUES (?, ?)",
+        (merchant_name, category_id),
+    )
+    return cur.lastrowid
+
+
+def _clean_text(value):
+    """Coerce a data_editor / form cell to None if it's NaN or blank, since
+    a blank optional text field round-trips through pandas as NaN, and
+    `NaN or None` evaluates to NaN (NaN is truthy), not None."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _invalidate_and_rerun():
+    """After any write: drop the cached reads and rerun, same as the
+    toolbar's own "Refresh data" button, so the change is visible
+    everywhere on the page immediately instead of waiting up to 60s for
+    the cache to expire on its own."""
+    load_table.clear()
+    get_data_status.clear()
+    st.rerun()
 
 
 def backend_ready():
@@ -731,6 +798,217 @@ def main():
         )
     else:
         st.info("No anomalies flagged yet.")
+
+    # --- Manage transactions --------------------------------------------------
+    # See _get_write_conn()'s docstring for why this is SQLite-tier-only.
+    st.subheader("✏️ Manage Transactions")
+    if BACKEND != "sqlite":
+        st.info("Manual entry/editing is available on the local SQLite tier only. "
+                 "The cloud tier's dbt pipeline rebuilds `analytics.*` from `raw.*` "
+                 "on every run, so a direct write here would just be overwritten "
+                 "on the next run -- see ROADMAP.md.")
+    else:
+        categories_df = load_table("categories")
+        merchants_df = load_table("merchants")
+        category_by_id = dict(zip(categories_df["category_id"], categories_df["category_name"]))
+        category_names = categories_df["category_name"].tolist()
+        merchant_names = merchants_df["merchant_name"].tolist()
+        merchant_default_cat = dict(zip(merchants_df["merchant_name"], merchants_df["default_category_id"]))
+
+        add_tab, edit_tab, rules_tab = st.tabs(
+            ["➕ Add transaction", "\U0001F5C2️ Edit / delete", "\U0001F3f7️ Category rules"]
+        )
+
+        # --- Add ---------------------------------------------------------
+        with add_tab:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                new_date = st.date_input("Date", value=datetime.today(), key="new_txn_date")
+                new_type = st.selectbox("Type", ["debit", "credit"], key="new_txn_type")
+            with c2:
+                new_amount = st.number_input(
+                    "Amount ($)", min_value=0.01, step=1.0, format="%.2f", key="new_txn_amount"
+                )
+                merchant_choice = st.selectbox(
+                    "Merchant", ["(none)"] + sorted(merchant_names) + ["+ Add new merchant"],
+                    key="new_txn_merchant",
+                )
+            new_merchant_name = None
+            if merchant_choice == "+ Add new merchant":
+                new_merchant_name = st.text_input("New merchant name", key="new_txn_new_merchant")
+
+            # Auto-categorization, part 1: suggest (never silently force) a
+            # category the moment a known merchant is picked.
+            suggested_category = None
+            if merchant_choice not in ("(none)", "+ Add new merchant"):
+                suggested_category = category_by_id.get(merchant_default_cat.get(merchant_choice))
+
+            # A selectbox's `index=` argument is only honored the very first
+            # time a widget with that `key` is created -- on every later
+            # rerun Streamlit keeps whatever's already in session_state for
+            # that key and silently ignores `index=`. So changing merchants
+            # and expecting the category dropdown to visually follow needs
+            # an explicit session_state write *before* the widget is
+            # instantiated, guarded so it only fires when the merchant
+            # selection itself just changed -- otherwise it would stomp on
+            # a manual category override every time an unrelated widget
+            # (e.g. the description field) triggers a rerun.
+            if st.session_state.get("_new_txn_category_synced_for") != merchant_choice:
+                if suggested_category:
+                    st.session_state["new_txn_category"] = suggested_category
+                st.session_state["_new_txn_category_synced_for"] = merchant_choice
+
+            with c3:
+                new_category = st.selectbox("Category", category_names, key="new_txn_category")
+                new_recurring = st.checkbox("Recurring", key="new_txn_recurring")
+
+            new_description = st.text_input("Description (optional)", key="new_txn_description")
+
+            if suggested_category:
+                st.caption(f"ℹ️ Auto-suggested **{suggested_category}** from this "
+                            "merchant's history -- change it above if this one's different.")
+            elif merchant_choice == "+ Add new merchant" and new_merchant_name:
+                st.caption("New merchant -- the category you pick above will be remembered "
+                            "as its default from now on (auto-categorization, part 2).")
+
+            if st.button("Add transaction", type="primary", key="add_txn_submit"):
+                merchant_to_use = (
+                    _clean_text(new_merchant_name) if merchant_choice == "+ Add new merchant"
+                    else (merchant_choice if merchant_choice != "(none)" else None)
+                )
+                if merchant_choice == "+ Add new merchant" and not merchant_to_use:
+                    st.error("Enter a name for the new merchant, or choose an existing one.")
+                else:
+                    conn = _get_write_conn()
+                    try:
+                        category_id = int(
+                            categories_df.loc[categories_df["category_name"] == new_category, "category_id"].iloc[0]
+                        )
+                        merchant_id = (
+                            _get_or_create_merchant(conn, merchant_to_use, category_id)
+                            if merchant_to_use else None
+                        )
+                        conn.execute(
+                            """INSERT INTO transactions
+                               (account_id, merchant_id, category_id, txn_date, amount,
+                                txn_type, description, is_recurring)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (account_id, merchant_id, category_id, new_date.isoformat(),
+                             round(abs(float(new_amount)), 2), new_type,
+                             _clean_text(new_description), int(new_recurring)),
+                        )
+                        conn.commit()
+                        st.success(f"Added {new_type} of ${new_amount:,.2f} on {new_date.isoformat()}.")
+                        _invalidate_and_rerun()
+                    finally:
+                        conn.close()
+
+        # --- Edit / delete -------------------------------------------------
+        with edit_tab:
+            all_txns = load_table("all_transactions", {"account_id": account_id})
+            if all_txns.empty:
+                st.info("No transactions yet for this account.")
+            else:
+                display_txns = all_txns.rename(columns={
+                    "txn_date": "Date", "merchant_name": "Merchant", "category_name": "Category",
+                    "amount": "Amount", "txn_type": "Type", "description": "Description",
+                    "is_recurring": "Recurring",
+                }).set_index("transaction_id")
+                display_txns["Date"] = pd.to_datetime(display_txns["Date"]).dt.date
+                display_txns["Recurring"] = display_txns["Recurring"].astype(bool)
+                display_txns["Delete?"] = False
+
+                st.caption(f"Showing the {len(display_txns):,} most recent transactions for "
+                            "this account. Edit a cell, or check “Delete?”, then save.")
+                edited = st.data_editor(
+                    display_txns,
+                    column_config={
+                        "Category": st.column_config.SelectboxColumn(options=category_names, required=True),
+                        "Type": st.column_config.SelectboxColumn(options=["debit", "credit"], required=True),
+                        "Amount": st.column_config.NumberColumn(format="$%.2f", min_value=0.01),
+                        "Date": st.column_config.DateColumn(format="YYYY-MM-DD", required=True),
+                        "Delete?": st.column_config.CheckboxColumn(
+                            help="Check, then Save changes, to permanently delete this row."
+                        ),
+                    },
+                    num_rows="fixed",
+                    width="stretch",
+                    key="edit_txn_editor",
+                )
+                if st.button("\U0001F4be Save changes", key="save_txn_edits"):
+                    conn = _get_write_conn()
+                    try:
+                        n_deleted = n_updated = 0
+                        for txn_id, row in edited.iterrows():
+                            if row["Delete?"]:
+                                conn.execute(
+                                    "DELETE FROM transactions WHERE transaction_id = ?", (int(txn_id),)
+                                )
+                                n_deleted += 1
+                                continue
+                            category_id = int(
+                                categories_df.loc[categories_df["category_name"] == row["Category"], "category_id"].iloc[0]
+                            )
+                            merchant_name = _clean_text(row["Merchant"])
+                            merchant_id = (
+                                _get_or_create_merchant(conn, merchant_name, category_id)
+                                if merchant_name else None
+                            )
+                            conn.execute(
+                                """UPDATE transactions
+                                   SET txn_date = ?, merchant_id = ?, category_id = ?, amount = ?,
+                                       txn_type = ?, description = ?, is_recurring = ?
+                                   WHERE transaction_id = ?""",
+                                (pd.Timestamp(row["Date"]).strftime("%Y-%m-%d"), merchant_id, category_id,
+                                 round(abs(float(row["Amount"])), 2), row["Type"],
+                                 _clean_text(row["Description"]), int(bool(row["Recurring"])), int(txn_id)),
+                            )
+                            n_updated += 1
+                        conn.commit()
+                        st.success(f"Saved: {n_updated} updated, {n_deleted} deleted.")
+                        _invalidate_and_rerun()
+                    finally:
+                        conn.close()
+
+        # --- Category rules --------------------------------------------------
+        with rules_tab:
+            st.caption("Each merchant's default category -- the suggestion shown on the "
+                        "Add tab when you pick that merchant. Editing it here only changes "
+                        "the suggestion going forward, not any past transactions.")
+            rules_df = merchants_df.copy()
+            rules_df["Default Category"] = rules_df["default_category_id"].map(category_by_id)
+            rules_df = rules_df.rename(columns={"merchant_name": "Merchant"})
+            rules_df = rules_df.set_index("merchant_id")[["Merchant", "Default Category"]]
+            edited_rules = st.data_editor(
+                rules_df,
+                column_config={
+                    "Merchant": st.column_config.TextColumn(disabled=True),
+                    "Default Category": st.column_config.SelectboxColumn(
+                        options=category_names, required=True
+                    ),
+                },
+                num_rows="fixed",
+                width="stretch",
+                key="rules_editor",
+            )
+            if st.button("\U0001F4be Save category rules", key="save_rules"):
+                conn = _get_write_conn()
+                try:
+                    n = 0
+                    for merchant_id, row in edited_rules.iterrows():
+                        new_cat_id = int(
+                            categories_df.loc[categories_df["category_name"] == row["Default Category"], "category_id"].iloc[0]
+                        )
+                        conn.execute(
+                            "UPDATE merchants SET default_category_id = ? WHERE merchant_id = ?",
+                            (new_cat_id, int(merchant_id)),
+                        )
+                        n += 1
+                    conn.commit()
+                    st.success(f"Updated {n} merchant categor{'y' if n == 1 else 'ies'}.")
+                    _invalidate_and_rerun()
+                finally:
+                    conn.close()
 
     render_integrations()
 
