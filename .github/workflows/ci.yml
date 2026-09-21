@@ -81,3 +81,49 @@ jobs:
         run: |
           python ml_anomaly.py
           python ml_forecast.py
+
+  local-tier:
+    # The SQLite/local-quickstart tier is the one actually deployed at
+    # https://finance-health-monitor.streamlit.app/, but until this job
+    # existed it had zero CI coverage of its own -- the job above only ever
+    # exercises the Postgres/cloud tier. No service container needed here:
+    # everything (data generation, the ETL load, the ML scripts, and the
+    # dashboard itself) runs against a throwaway SQLite file on the runner.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest flake8
+
+      - name: Lint
+        run: flake8 etl ml
+        # dashboard/app.py isn't linted yet -- it predates this job and
+        # carries a handful of pre-existing style issues (long lines, one
+        # blank-line spacing issue) that are a separate, smaller cleanup
+        # from "add test coverage." Tracked in ROADMAP.md rather than
+        # silently expanded into this change.
+
+      - name: Generate synthetic data
+        run: python data/generate_data.py
+
+      - name: Load into SQLite (etl/load_to_db.py)
+        run: python etl/load_to_db.py
+
+      - name: Run ML scripts (writes ml_anomaly_flags + ml_cashflow_forecast)
+        run: |
+          python ml/detect_anomalies.py
+          python ml/forecast_cashflow.py
+
+      - name: Unit test ETL validation logic and ML scripts
+        run: pytest etl/test_load_to_db.py ml/test_ml_scripts.py -v
+
+      - name: Dashboard regression tests (AppTest -- login, recommendations, exports)
+        run: pytest dashboard/test_app.py -v
