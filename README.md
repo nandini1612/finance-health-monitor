@@ -239,6 +239,15 @@ streamlit run dashboard/app.py    # 5. view the dashboard at localhost:8501
 missing — e.g. right after cloning — so steps 1-4 are optional convenience,
 not a hard requirement.)
 
+To run this tier's own test suite locally (same three files the
+`local-tier` CI job runs):
+
+```bash
+pip install pytest
+pytest etl/test_load_to_db.py ml/test_ml_scripts.py -v   # pure unit tests, no data needed
+pytest dashboard/test_app.py -v                          # needs steps 1-4 above run first
+```
+
 **Cloud edition**, once you have a Postgres instance reachable (real RDS
 via `cloud/terraform/`, or local/Docker Postgres paired with the free
 LocalStack S3 path in `cloud/terraform-localstack/`):
@@ -286,8 +295,15 @@ its output against ground truth you control.
 - **Orchestration & IaC**: an Airflow DAG that gates ML tasks behind a dbt
   test pass, and Terraform-provisioned infrastructure (real AWS, or a
   free LocalStack alternative).
-- **CI**: GitHub Actions runs lint, the full dbt build/test cycle against
-  an ephemeral Postgres container, and the pytest suite on every push.
+- **CI**: two independent GitHub Actions jobs, one per tier. `cloud-pipeline`
+  runs lint, the full dbt build/test cycle against an ephemeral Postgres
+  container, and pytest for the cloud-tier pipeline code. `local-tier`
+  generates synthetic data, loads it through the SQLite ETL step, runs
+  both ML scripts, and runs 31 pytest tests covering ETL validation logic,
+  the ML scripts' edge cases, and the dashboard itself (login, access
+  control, the recommendations panel) via `streamlit.testing.v1.AppTest`
+  — the tier actually running at the live demo link had no CI coverage of
+  its own until this job existed.
 - **BI**: a working Streamlit dashboard (budget vs. actual, recurring
   subscriptions, anomaly flags, cash-flow forecast) that reads either
   backend through the same code, plus a native path to point Power BI or
@@ -329,6 +345,10 @@ its output against ground truth you control.
   quantified actions — dollars saved, runway impact, forecast impact —
   using a transparent rules engine instead of a model, prioritizing
   interpretability over unwarranted ML complexity."
+- "Closed a test-coverage gap by adding 31 pytest tests (ETL validation
+  logic, ML edge cases, and Streamlit UI regression tests via AppTest) and
+  a second CI job covering the tier actually running in production, which
+  previously had none."
 
 ## A note on honesty
 
