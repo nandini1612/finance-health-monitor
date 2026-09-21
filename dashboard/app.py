@@ -464,6 +464,107 @@ def _slug(text):
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
+def _compute_recommendations(category_spend, budget_vs_actual, current_balance, avg_daily_burn,
+                              forecast, cut_pct):
+    """Rules-based "what if" recommendations -- deliberately NOT a model.
+
+    Every number here is plain arithmetic pulled from the same tables that
+    already back the KPI row, the category chart, and the budget chart
+    above, so a skeptical reader can check the math themselves rather than
+    trust a black box. This is the honest way to do "prescriptive": no
+    hidden model, no training data, no claim of predicting behavior -- just
+    "if X changed, here is exactly what that does to your numbers."
+
+    Two kinds of recommendation, ranked over-budget-first:
+      1. A category already over budget this month. The recommendation is
+         "get back to budget," and the savings is the actual overage --
+         a fact already sitting in the data, not a guess.
+      2. The largest discretionary/variable-expense categories that are
+         NOT already over budget. The recommendation is a hypothetical cut
+         of `cut_pct`% (a slider in the UI) -- this one genuinely is a
+         what-if, and is labeled as such.
+
+    Each recommendation is translated into two consequences a person can
+    act on: the change to this account's runway (same avg_daily_burn as
+    the KPI row) and the shift in the 30-day forecasted ending balance
+    (same series as the forecast chart above).
+    """
+    if category_spend.empty:
+        return []
+
+    latest_month = category_spend["month"].max()
+    latest_spend = category_spend[category_spend["month"] == latest_month]
+
+    recs = []
+    seen_categories = set()
+
+    if not budget_vs_actual.empty:
+        bva_latest = budget_vs_actual[budget_vs_actual["month"] == latest_month].copy()
+        bva_latest["overage"] = bva_latest["actual_amount"] - bva_latest["budgeted_amount"]
+        over = bva_latest[bva_latest["overage"] > 0].sort_values("overage", ascending=False)
+        for _, row in over.iterrows():
+            recs.append({
+                "category": row["category_name"],
+                "headline": (f"\U0001F534 {row['category_name']} is ${row['overage']:,.0f} over its "
+                             f"${row['budgeted_amount']:,.0f} budget this month "
+                             f"(${row['actual_amount']:,.0f} spent)."),
+                "action": "Get back to budget",
+                "monthly_savings": float(row["overage"]),
+            })
+            seen_categories.add(row["category_name"])
+
+    discretionary = latest_spend[
+        latest_spend["category_group"].isin(["discretionary", "variable_expense"])
+        & ~latest_spend["category_name"].isin(seen_categories)
+    ].sort_values("total_amount", ascending=False)
+    for _, row in discretionary.iterrows():
+        savings = float(row["total_amount"]) * (cut_pct / 100.0)
+        if savings <= 0:
+            continue
+        recs.append({
+            "category": row["category_name"],
+            "headline": (f"\U0001F4A1 {row['category_name']} is your top discretionary/variable "
+                         f"spend this month at ${row['total_amount']:,.0f}."),
+            "action": f"Hypothetical: cut it by {cut_pct}%",
+            "monthly_savings": savings,
+        })
+        seen_categories.add(row["category_name"])
+
+    latest_forecast_balance = float(forecast["predicted_balance"].iloc[-1]) if not forecast.empty else None
+
+    for rec in recs:
+        monthly_savings = rec["monthly_savings"]
+        daily_savings = monthly_savings / 30.0
+        # "Runway" (balance / burn) only means something for a positive
+        # balance -- for a negative one, dividing by a *smaller* burn rate
+        # after the hypothetical cut makes the ratio a *bigger* negative
+        # number, which would read as "spending less makes it worse." That's
+        # a real degenerate case of the ratio, not a bug, but it's the kind
+        # of thing an attentive reviewer would flag, so it's suppressed here
+        # rather than shown as a confusing negative-days delta.
+        if avg_daily_burn > 0 and current_balance > 0:
+            old_runway = current_balance / avg_daily_burn
+            new_burn = max(avg_daily_burn - daily_savings, 0.0)
+            new_runway = (current_balance / new_burn) if new_burn > 0 else float("inf")
+            rec["old_runway"], rec["new_runway"] = old_runway, new_runway
+            rec["runway_na_reason"] = None
+        else:
+            rec["old_runway"] = rec["new_runway"] = None
+            rec["runway_na_reason"] = (
+                "not meaningful with a negative balance" if current_balance <= 0 else "no burn detected"
+            )
+        if latest_forecast_balance is not None:
+            rec["old_forecast_balance"] = latest_forecast_balance
+            rec["new_forecast_balance"] = latest_forecast_balance + monthly_savings
+        else:
+            rec["old_forecast_balance"] = rec["new_forecast_balance"] = None
+
+    # Capped at 3 so this reads as "here's what to actually do," not
+    # another wall of data -- the same reasoning as the CSV export button
+    # for anomalies: surface the highest-signal items, not everything.
+    return recs[:3]
+
+
 def _redact_db_host(url):
     """Show which host we're actually querying without leaking credentials
     -- used only for a status label, never logged or sent anywhere."""
@@ -621,6 +722,63 @@ def main():
     if runway_days < 60:
         st.warning(f"⚠️ At the current burn rate, this account has an estimated "
                     f"{runway_days:,.0f}-day runway. Consider reviewing discretionary spend below.")
+
+    # --- Prescriptive recommendations ---------------------------------------
+    # The roadmap's own framing: move from descriptive ("here's an anomaly")
+    # to prescriptive ("cutting dining spend by 15% gets your runway back
+    # over 90 days"). Deliberately not an ML model -- see
+    # _compute_recommendations' docstring for why a transparent rules engine
+    # is the more defensible choice here. Uses the latest month regardless
+    # of the date-range picker below, same as the KPI row above: this is a
+    # "what should I do right now" panel, not something you'd browse
+    # historically.
+    st.subheader("\U0001F4A1 Prescriptive Recommendations")
+    with st.container(border=True):
+        cut_pct = st.slider(
+            "Hypothetical cut applied to top discretionary/variable categories "
+            "not already over budget",
+            min_value=5, max_value=30, value=15, step=5, key="rec_cut_pct",
+        )
+        recommendations = _compute_recommendations(
+            category_spend, budget_vs_actual, current_balance, avg_daily_burn, forecast, cut_pct,
+        )
+        if not recommendations:
+            st.info("Nothing stands out this month -- no budgets exceeded and no notable "
+                     "discretionary/variable spend to trim.")
+        else:
+            for i, rec in enumerate(recommendations):
+                st.markdown(f"**{rec['headline']}**")
+                st.caption(f"{rec['action']} → frees up ~${rec['monthly_savings']:,.0f}/month")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Monthly savings", f"${rec['monthly_savings']:,.0f}")
+                if rec["old_runway"] is not None:
+                    old_txt = "∞" if rec["old_runway"] == float("inf") else f"{rec['old_runway']:,.0f}d"
+                    new_txt = "∞" if rec["new_runway"] == float("inf") else f"{rec['new_runway']:,.0f}d"
+                    if rec["new_runway"] == float("inf"):
+                        delta_txt = "no longer burning cash"
+                    else:
+                        diff_days = round(rec["new_runway"] - rec["old_runway"])
+                        # round() can produce -0 for a negligible negative
+                        # diff (e.g. a $5 cut against a huge burn rate);
+                        # "-0" reads as a display bug, so normalize it.
+                        delta_txt = "no meaningful change" if diff_days == 0 else f"{diff_days:+,} days"
+                    m2.metric("Runway", f"{old_txt} → {new_txt}", delta=delta_txt)
+                else:
+                    m2.metric("Runway", "n/a", delta=rec["runway_na_reason"])
+                if rec["old_forecast_balance"] is not None:
+                    m3.metric(
+                        "30-day forecasted balance",
+                        f"${rec['new_forecast_balance']:,.0f}",
+                        delta=f"+${rec['monthly_savings']:,.0f} vs ${rec['old_forecast_balance']:,.0f} shown above",
+                    )
+                else:
+                    m3.metric("30-day forecasted balance", "n/a", delta="no forecast yet")
+                if i < len(recommendations) - 1:
+                    st.divider()
+        st.caption("Rules-based, not a model: every number above is plain arithmetic from the "
+                    "same tables behind the KPIs, the category chart, and the forecast, so you "
+                    "can check the math yourself. Over-budget rows use the actual overage; "
+                    "everything else uses the hypothetical cut % set above.")
 
     # --- Cash flow trend + forecast ---------------------------------------
     # These used to share one chart (monthly bars + daily forecast line on a

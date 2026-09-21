@@ -110,6 +110,14 @@ inline comments:
   protect — and a private, gitignored secrets file would break the
   "clone it, or open the live link, and it just works" promise this whole
   project is built around. See **Authentication** below.
+- **Recommendations are rules, not a model.** The "Prescriptive
+  Recommendations" panel deliberately does not use ML: it's plain
+  arithmetic (this month's overage, or a hypothetical cut %) applied to
+  the same numbers already shown in the KPI row and the forecast chart. A
+  black-box model producing "spend less on X" would be strictly harder to
+  trust and easier to fake than a rule a reader can verify by hand in ten
+  seconds — the honest choice here was to *not* reach for ML just because
+  the rest of the project has some.
 
 ## Authentication
 
@@ -287,6 +295,11 @@ its output against ground truth you control.
 - **Auth & access control**: bcrypt-hashed, cookie-persisted login via
   streamlit-authenticator, with per-login account restriction rather than
   an all-or-nothing gate.
+- **Product thinking**: a "Prescriptive Recommendations" panel that goes
+  beyond descriptive ML output ("here's an anomaly," "here's a forecast")
+  to an actual next action, quantified in the same units as the rest of
+  the page (dollars/month, runway days, forecasted balance) — and does it
+  with a transparent rule instead of a model, on purpose.
 
 ## Resume / interview bullet points
 
@@ -311,6 +324,11 @@ its output against ground truth you control.
   cookies) with per-login access control, restricting each login to its
   own account(s) rather than gating the app as a single all-or-nothing
   door."
+- "Designed a prescriptive-recommendations feature that translates
+  descriptive analytics (budget variance, category spend) into ranked,
+  quantified actions — dollars saved, runway impact, forecast impact —
+  using a transparent rules engine instead of a model, prioritizing
+  interpretability over unwarranted ML complexity."
 
 ## A note on honesty
 
