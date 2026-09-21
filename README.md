@@ -4,7 +4,10 @@ An end-to-end data pipeline that predicts cash-flow trouble and flags
 suspicious transactions before they become a crisis, for individuals and
 small businesses managing multiple accounts.
 
-**[Live demo →](https://finance-health-monitor.streamlit.app/)**
+**[Live demo →](https://finance-health-monitor.streamlit.app/)** — log in with
+`demo` / `CashPulseDemo!26` (all 5 accounts), or `nina` / `NinaDemo!26` (just
+Nina's personal account, to see the per-login access restriction in action).
+These credentials are meant to be public — see **Authentication** below.
 
 ## Why this project
 
@@ -95,6 +98,36 @@ inline comments:
   account needed — paired with a real Postgres run locally, since
   LocalStack's free tier mocks RDS's API but doesn't run a database behind
   it. That limitation is stated directly rather than glossed over.
+- **Real authentication, not a hand-rolled password check.** The
+  dashboard sits behind [streamlit-authenticator](https://github.com/mkhorasani/Streamlit-Authenticator)
+  (bcrypt-hashed credentials, a signed session cookie, a logout button) —
+  "don't roll your own auth" applies to a portfolio project too. Logins
+  are also scoped per-account (`nina` only ever sees Nina's account; `demo`
+  sees all five), which is what makes this real access control rather
+  than just a locked door. The credentials themselves are intentionally
+  public and checked into `.streamlit/secrets.toml`: every login sees the
+  same synthetic dataset, never real financial data, so there's nothing to
+  protect — and a private, gitignored secrets file would break the
+  "clone it, or open the live link, and it just works" promise this whole
+  project is built around. See **Authentication** below.
+
+## Authentication
+
+The live demo (and a local run) requires logging in:
+
+| Username | Password | Sees |
+|---|---|---|
+| `demo` | `CashPulseDemo!26` | All 5 demo accounts |
+| `nina` | `NinaDemo!26` | Only Nina's Personal Checking |
+
+Both are also shown directly on the app's own login screen. Credentials
+and per-login account access live in `.streamlit/secrets.toml`
+(`[auth.credentials]` and `[auth.account_access]`) — edit that file to
+add logins, change passwords (re-hash with
+`streamlit_authenticator.Hasher().hash("new-password")`), or change who
+sees which account. This is SQLite-and-Postgres-tier agnostic: it gates
+the app itself, not either database, so it works the same way regardless
+of `DATABASE_URL`.
 
 ## Architecture
 
@@ -151,6 +184,9 @@ clean, tested views, never raw tables.
 
 ```
 finance-health-monitor/
+├── .streamlit/
+│   ├── config.toml              # theme
+│   └── secrets.toml              # auth credentials + per-login account access (see Authentication)
 ├── data/
 │   ├── generate_data.py        # synthetic data generator (Faker)
 │   └── finance.db              # created by etl/load_to_db.py (gitignored)
@@ -248,6 +284,9 @@ its output against ground truth you control.
   subscriptions, anomaly flags, cash-flow forecast) that reads either
   backend through the same code, plus a native path to point Power BI or
   Tableau at the same database.
+- **Auth & access control**: bcrypt-hashed, cookie-persisted login via
+  streamlit-authenticator, with per-login account restriction rather than
+  an all-or-nothing gate.
 
 ## Resume / interview bullet points
 
@@ -268,6 +307,10 @@ its output against ground truth you control.
 - "Designed a normalized database schema and BI-ready SQL views/marts to
   decouple data storage from reporting, enabling both a custom dashboard
   and Power BI/Tableau to consume the same clean data layer."
+- "Implemented authentication (bcrypt-hashed credentials, signed session
+  cookies) with per-login access control, restricting each login to its
+  own account(s) rather than gating the app as a single all-or-nothing
+  door."
 
 ## A note on honesty
 

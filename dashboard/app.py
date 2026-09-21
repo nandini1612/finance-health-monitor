@@ -43,6 +43,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit_authenticator as stauth
 
 LOCAL_DB_PATH = Path(__file__).parent.parent / "data" / "finance.db"
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -129,7 +130,69 @@ AWS_INTEGRATION_MODE = os.environ.get("AWS_INTEGRATION_MODE", "").strip().lower(
 ASSETS_DIR = Path(__file__).parent / "assets" / "integration_proof"
 POWERBI_URL_FILE = Path(__file__).parent / "assets" / "powerbi_report_url.txt"
 
+def _require_login():
+    """Gate the whole app behind a login before anything else renders.
+
+    Uses streamlit-authenticator (bcrypt-hashed passwords + a signed cookie
+    for session persistence across a page refresh, plus a logout button)
+    rather than hand-rolling anything security-adjacent -- "don't roll your
+    own auth" applies just as much to a portfolio project as a real one.
+
+    The credentials in .streamlit/secrets.toml are deliberately checked
+    into git and shown right on the login screen, which would be a real
+    problem for an app protecting real accounts -- but there is nothing to
+    protect here. Every login sees the same synthetic, seeded dataset
+    `data/generate_data.py` produces, never anyone's real financial data.
+    Publishing the demo logins is what keeps this a genuine "open the link
+    and use it" portfolio piece instead of a private tool nobody but you
+    can open -- the same reasoning as the rest of this project's honesty
+    pattern (see the Integrations panel, and README's "Key design
+    decisions").
+
+    Returns (authenticator, username) once logged in; calls st.stop()
+    first otherwise, so nothing after this call ever runs unauthenticated.
+    """
+    auth_cfg = st.secrets["auth"]
+    authenticator = stauth.Authenticate(
+        auth_cfg["credentials"].to_dict(),
+        auth_cfg["cookie"]["name"],
+        auth_cfg["cookie"]["key"],
+        auth_cfg["cookie"]["expiry_days"],
+    )
+    authenticator.login(location="main")
+    auth_status = st.session_state.get("authentication_status")
+
+    if auth_status is False:
+        st.error("Username or password is incorrect.")
+        st.stop()
+    if auth_status is not True:
+        st.info(
+            "**Demo credentials** -- this is a public portfolio demo running on "
+            "synthetic data only, so these are meant to be used by anyone:\n\n"
+            "- `demo` / `CashPulseDemo!26` -- sees all 5 demo accounts\n"
+            "- `nina` / `NinaDemo!26` -- sees only Nina's personal account, to "
+            "show the per-login access restriction actually working"
+        )
+        st.stop()
+
+    # login() only calls st.rerun() itself when using a file-based config
+    # (`path=`); with a plain dict (this app's setup, since credentials
+    # live in st.secrets) it never does, so the same script run that just
+    # processed the submitted form keeps going and renders the whole
+    # dashboard *below* the still-drawn login form -- a jarring "both at
+    # once" flash right after a successful login. Rerunning once, tracked
+    # so it only fires the one time per login rather than looping, gives a
+    # clean transition straight to the dashboard instead.
+    if not st.session_state.get("_post_login_rerun_done"):
+        st.session_state["_post_login_rerun_done"] = True
+        st.rerun()
+
+    return authenticator, st.session_state["username"]
+
+
 st.set_page_config(page_title="CashPulse", page_icon="\U0001F4B0", layout="wide")
+
+_authenticator, _username = _require_login()
 
 if BACKEND == "sqlite":
     _bootstrap_local_data()
@@ -466,6 +529,17 @@ def render_integrations():
 
 
 def main():
+    with st.sidebar:
+        st.caption(f"Logged in as **{st.session_state.get('name', _username)}**")
+        _authenticator.logout("Log out", "sidebar")
+        # logout() doesn't rerun on its own, so without this, the rest of
+        # this page keeps rendering with stale (now-invalid) auth state for
+        # one more pass before the login gate reappears on the next
+        # interaction. Rerunning immediately makes "Log out" feel instant.
+        if not st.session_state.get("authentication_status"):
+            st.session_state.pop("_post_login_rerun_done", None)
+            st.rerun()
+
     st.title("\U0001F4B0 CashPulse")
     st.caption("Personal & SME finance health monitor")
 
@@ -480,6 +554,20 @@ def main():
         return
 
     accounts = load_table("accounts")
+
+    # Restrict which accounts this login can see. "*" means full access
+    # (the "demo" login); anything else is an exact list of account names --
+    # this is what makes "Authentication" in the roadmap mean more than
+    # just a locked door: different logins genuinely see different data,
+    # the way real multi-tenant access control would.
+    allowed = st.secrets["auth"]["account_access"].get(_username, [])
+    if "*" not in allowed:
+        accounts = accounts[accounts["account_name"].isin(allowed)]
+    if accounts.empty:
+        st.error(f"No accounts are configured for **{_username}** in "
+                  "`st.secrets['auth']['account_access']`. Contact whoever set up this deploy.")
+        st.stop()
+
     source_label, txn_count, freshness = get_data_status()
 
     # --- Toolbar: account picker + live data badge -----------------------
