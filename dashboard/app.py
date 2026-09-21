@@ -577,10 +577,10 @@ def _redact_db_host(url):
 
 def render_integrations():
     """Real integration status, read live from the environment and from
-    files you drop in yourself after finishing the steps in
-    INTEGRATION_PROOF_GUIDE.md -- there is no hardcoded "connected" state
-    here. If you haven't done the AWS/Power BI setup yet, this honestly
-    says so instead of faking it."""
+    files you drop in yourself after wiring up real AWS/Power BI (see the
+    README's "Connecting real AWS & BI tools" section) -- there is no
+    hardcoded "connected" state here. If you haven't done that setup yet,
+    this honestly says so instead of faking it."""
     st.subheader("Integrations & Proof")
 
     aws_col, bi_col = st.columns(2)
@@ -593,7 +593,7 @@ def render_integrations():
             st.caption("Practice mode, not real AWS: Terraform provisioned S3 against "
                        "LocalStack (a free, no-account AWS simulator), and this Postgres "
                        "is running locally/in Docker as a stand-in for RDS -- no AWS "
-                       "account or card was used. See INTEGRATION_PROOF_GUIDE.md.")
+                       "account or card was used.")
         elif BACKEND == "postgres":
             host = _redact_db_host(DATABASE_URL)
             st.success(f"Connected · querying RDS Postgres at `{host}`")
@@ -603,7 +603,8 @@ def render_integrations():
             st.info("Not connected yet · reading local SQLite")
             st.caption("Provision real AWS via `cloud/terraform`, or the free no-account "
                        "path via `cloud/terraform-localstack` -- either flips this "
-                       "automatically once DATABASE_URL is set. See INTEGRATION_PROOF_GUIDE.md.")
+                       "automatically once DATABASE_URL is set. See the README's "
+                       "\"Connecting real AWS & BI tools\" section.")
         aws_screenshot = ASSETS_DIR / "aws_rds.png"
         if aws_screenshot.exists():
             caption = ("LocalStack + local Postgres -- terraform apply / awslocal output"
@@ -623,7 +624,8 @@ def render_integrations():
             st.info("Not connected yet")
             st.caption("Connect Power BI or Tableau to this database and publish a report, "
                        "then save the link in dashboard/assets/powerbi_report_url.txt to "
-                       "show it here automatically -- see INTEGRATION_PROOF_GUIDE.md.")
+                       "show it here automatically -- see the README's \"Connecting real "
+                       "AWS & BI tools\" section.")
         bi_screenshot = ASSETS_DIR / "powerbi_report.png"
         if bi_screenshot.exists():
             st.image(str(bi_screenshot), caption="Power BI report -- model & visuals", width="stretch")
